@@ -2,10 +2,10 @@
 
 //! BaseFold ZK implementation of the IOP prover channel.
 
-use std::ops::Deref;
+use std::{iter, ops::Deref};
 
-use binius_compute::Allocator;
-use binius_field::{BinaryField, Field, PackedField, util::powers};
+use binius_alloc::Allocator;
+use binius_field::{BinaryField, PackedField, util::powers};
 use binius_iop::{
 	basefold::layout::RoundLayout,
 	channel::{OracleSchedule, OracleSpec},
@@ -27,7 +27,7 @@ use itertools::izip;
 use rand::{CryptoRng, SeedableRng, rngs::StdRng};
 
 use crate::{
-	basefold::prove_sumcheck_basefold,
+	basefold::{index_rounds::IndexNode, prove_sumcheck_basefold},
 	channel::IOPProverChannel,
 	fri::{self, FRIFoldProver, MaskedCodeword},
 	merkle_channel::MerkleIPProverChannel,
@@ -54,6 +54,9 @@ struct CommittedOracleData<P: PackedField, C, Data: Deref<Target = [P]>> {
 	commitment: C,
 	/// The committed round oracle `pi_i`, holding each constituent sent by
 	/// [`IOPProverChannel::send_oracle`] in its block, in the caller's allocator.
+	///
+	/// A ZK round oracle also holds its ZK pad, and is stored reversed by
+	/// [`zk_commit_index`](binius_iop::basefold::layout::zk_commit_index), as it is committed.
 	message: FieldBuffer<P, Data>,
 }
 
@@ -70,6 +73,8 @@ type Relation<P, Data> = Vec<(BaseFoldOracle, FieldBuffer<P, Data>)>;
 /// This channel owns an [`StdRng`] and generates random masks internally during
 /// [`send_oracle`](IOPProverChannel::send_oracle). The caller provides only the raw witness
 /// buffer (not doubled). The channel handles:
+/// - Filling each ZK round's pad with uniform elements and reversing the round as it is committed
+///   (see [`binius_iop::basefold::layout`])
 /// - Generating a random mask of equal length
 /// - Interleaving witness and mask for FRI commitment
 /// - Running ZK BaseFold proofs in [`Self::finish`]
@@ -128,9 +133,10 @@ where
 	/// The FRI parameters should already account for ZK (log_batch_size = 1, doubled message
 	/// length).
 	///
-	/// The RNG seeds the channel's own generator, whose only output is the ZK masks.
-	/// A mask is what hides a committed witness at the positions the verifier opens.
-	/// Hiding is therefore only as strong as this RNG, so it must be a cryptographic one.
+	/// The RNG seeds the channel's own generator, whose only output is the ZK masks and pads.
+	/// A mask hides a round oracle through the folding phase, and a pad hides the codeword symbols
+	/// the verifier opens. Hiding is therefore only as strong as this RNG, so it must be a
+	/// cryptographic one.
 	pub fn new(
 		channel: Channel,
 		ntt: &'a NTT,
@@ -157,9 +163,19 @@ where
 	}
 
 	/// Encodes and commits the next round oracle, the one at index `committed_oracles.len()`.
-	fn commit_round_oracle(&mut self, message: FieldBuffer<P, A::Vec<P>>) {
+	fn commit_round_oracle(&mut self, mut message: FieldBuffer<P, A::Vec<P>>) {
 		let index = self.committed_oracles.len();
 		let layout = &self.layouts[index];
+
+		// A ZK round fills its pad with uniform elements and is committed reversed, which puts the
+		// pad on the lowest coefficients of its codeword. No operand reaches the pad, since every
+		// transparent vanishes above its oracle's content.
+		if layout.is_zk {
+			for i in layout.pad() {
+				message.set(i, F::random(&mut self.rng));
+			}
+			permute_to_zk_commit_order(message.as_mut_view());
+		}
 
 		// Encode round oracle `index` of the combined FRI parameters. ZK oracles interleave a fresh
 		// mask (`encode_masked`); non-ZK oracles encode the message alone (`encode_interleaved`).
@@ -246,15 +262,6 @@ where
 	}
 }
 
-/// The variable count of the largest round oracle.
-fn max_log_len(layouts: &[RoundLayout]) -> usize {
-	layouts
-		.iter()
-		.map(|layout| layout.log_len)
-		.max()
-		.expect("at least one oracle")
-}
-
 /// Proves the combined ZK BaseFold opening over all committed round oracles.
 ///
 /// This drives `channel` — the Merkle channel taken from the destructured
@@ -283,11 +290,16 @@ fn prove_batch_zk_basefold<A, F, P, NTT, Channel>(
 {
 	assert_eq!(layouts.len(), committed_oracles.len());
 
-	// `ℓ = max_r ℓ_r`, the variable count of the opening.
-	let n_vars = max_log_len(layouts);
 	let log_n_oracles = log2_ceil_usize(layouts.len());
 
-	let transparents = batch_relations(channel, layouts, relations, alloc);
+	// A ZK round's message is stored as committed, reversed, so its transparent is reversed to
+	// match. Reversing both sides of the inner product leaves it unchanged.
+	let mut transparents = batch_relations(channel, layouts, relations, alloc);
+	for (transparent, layout) in iter::zip(&mut transparents, layouts) {
+		if layout.is_zk {
+			permute_to_zk_commit_order(transparent.as_mut_view());
+		}
+	}
 
 	// The claim `s = Σ_r <M_r, T_r>`, which the verifier holds as the batched claim.
 	let s = izip!(&committed_oracles, &transparents)
@@ -325,52 +337,26 @@ fn prove_batch_zk_basefold<A, F, P, NTT, Channel>(
 		(s, None)
 	};
 
-	// `G` and `T` over `X` (low) and `Z` (high). The sumcheck binds `Z` high to low, but the FRI's
-	// outer tensor takes its first challenge as the low bit of the oracle index, so oracle `r`
-	// sits at chunk `bit_reverse(r)`.
-	let chunk_index = |r: usize| r.reverse_bits() >> (usize::BITS as usize - log_n_oracles);
-	let (combined, multiplicand) = {
-		let _scope = tracing::debug_span!("Compute batched witness").entered();
-		let mut combined = FieldBuffer::zeros_in(alloc, n_vars + log_n_oracles);
-		let mut multiplicand = FieldBuffer::zeros_in(alloc, n_vars + log_n_oracles);
-		for (r, (fri_oracle, committed, transparent)) in
-			izip!(fri_params.input_oracles(), &committed_oracles, &transparents).enumerate()
-		{
-			let n_r = committed.message.log_len();
-			let index = if log_n_oracles == 0 {
-				0
-			} else {
-				chunk_index(r)
-			};
-
-			// `M^γ_r↑`: the message in the low `2^{n_r}` of each lift block, repeated across the
-			// high dims so it is constant along them, as the FRI lifts and repeats its codeword.
-			place_repeated(
-				combined.chunk_mut(n_vars, index).chunk(),
-				committed.message.as_view(),
-				F::ONE,
-				n_r + fri_oracle.log_lift,
-			);
-			// `T_r↑`: supported only where the coordinates above `n_r` are zero, so that the sum
-			// of `M^γ_r↑ · T_r↑` over `X` is `<M^γ_r, T_r>`.
-			place_repeated(
-				multiplicand.chunk_mut(n_vars, index).chunk(),
-				transparent.as_view(),
-				F::ONE,
-				n_vars,
-			);
-		}
-		(combined, multiplicand)
-	};
-
 	// Codeword commitments in oracle-index order, matching `fri_params.input_oracles()`.
-	let committed_codewords = committed_oracles
-		.into_iter()
-		.map(|committed| (committed.codeword, committed.commitment))
-		.collect();
+	// The sumcheck binds the oracle-index variables `Z` first, and the FRI's outer tensor takes its
+	// first challenge as the low bit of the oracle index, so it pairs oracle `2k` with `2k + 1`.
+	// The oracle count is padded to a power of two with absent oracles.
+	let mut nodes = Vec::with_capacity(1 << log_n_oracles);
+	let mut committed_codewords = Vec::with_capacity(committed_oracles.len());
+	for (fri_oracle, committed, transparent) in
+		izip!(fri_params.input_oracles(), committed_oracles, transparents)
+	{
+		nodes.push(Some(IndexNode {
+			log_w: committed.message.log_len() + fri_oracle.log_lift,
+			message: committed.message,
+			transparent,
+		}));
+		committed_codewords.push((committed.codeword, committed.commitment));
+	}
+	nodes.resize_with(1 << log_n_oracles, || None);
 
 	let fri_folder = FRIFoldProver::new_batch(fri_params, ntt, committed_codewords);
-	prove_sumcheck_basefold(combined, multiplicand, target, gamma, fri_folder, channel, alloc);
+	prove_sumcheck_basefold(nodes, target, gamma, fri_folder, channel, alloc);
 }
 
 /// Batches the queued relations into the single relation `Σ_i <π_i, T_i> = S`.
@@ -442,57 +428,48 @@ fn copy_prefix<P: PackedField>(mut dst: FieldSliceMut<'_, P>, src: FieldSlice<'_
 	}
 }
 
-/// Adds `scalar · src` into the low `2^src.log_len()` scalars of every `2^log_block`-sized block
-/// of `dst`.
+/// Permutes a ZK round's table into the order the round is committed in, in place.
 ///
-/// This is the lift/repeat placement of one oracle into the combined buffer: the oracle occupies
-/// the low part of a lift block, and that block repeats across the high dims so the oracle is
-/// constant along them.
-///
-/// A block spanning at least one whole packed element gets a chunk of the buffer to itself. A
-/// narrower block does not: several of them then share one element, and no chunking can express
-/// the placement. The scalars of one element are the same repeating pattern for every element, so
-/// that pattern is built once and added to all of them.
-///
-/// ## Preconditions
-///
-/// * `src.log_len() <= log_block <= dst.log_len()`
-fn place_repeated<P: PackedField>(
-	mut dst: FieldSliceMut<'_, P>,
-	src: FieldSlice<'_, P>,
-	scalar: P::Scalar,
-	log_block: usize,
-) {
-	assert!(src.log_len() <= log_block); // precondition
-	assert!(log_block <= dst.log_len()); // precondition
+/// Entry `i` of the result is entry `zk_commit_index(i)` of the input, the index with its bits
+/// complemented (see [`binius_iop::basefold::layout::zk_commit_index`]), which reverses the order
+/// of the entries.
+fn permute_to_zk_commit_order<P: PackedField>(buffer: FieldSliceMut<'_, P>) {
+	reverse_scalars(buffer);
+}
 
-	let scalar_broadcast = P::broadcast(scalar);
-	if log_block >= P::LOG_WIDTH {
-		let chunk_packed = 1usize << (log_block - P::LOG_WIDTH);
-		dst.as_mut().par_chunks_mut(chunk_packed).for_each(|chunk| {
-			let chunk_buf = FieldSliceMut::from_slice(log_block, chunk);
-			accumulate_scaled_buffer(chunk_buf, src.as_view(), scalar_broadcast);
-		});
-	} else {
-		// Lane `k` of every element sits at position `k % 2^log_block` of its block, and carries
-		// the oracle only over the low `2^src.log_len()` of them. A buffer shorter than one
-		// element leaves its high lanes out of the pattern, so they stay zero.
-		let block_mask = (1usize << log_block) - 1;
-		let src_len = 1usize << src.log_len();
-		let lanes = P::WIDTH.min(1usize << dst.log_len());
-		let pattern = P::from_scalars((0..lanes).map(|lane| {
-			let position = lane & block_mask;
-			if position < src_len {
-				src.get(position)
+/// Reverses the order of the scalars of a buffer, in place.
+fn reverse_scalars<P: PackedField>(mut buffer: FieldSliceMut<'_, P>) {
+	let log_len = buffer.log_len();
+	let words = buffer.as_mut();
+	if log_len < P::LOG_WIDTH {
+		// The buffer is the low `2^log_len` lanes of a single element, whose other lanes stay.
+		let len = 1 << log_len;
+		let element = words[0];
+		words[0] = P::from_fn(|lane| {
+			if lane < len {
+				element.get(len - 1 - lane)
 			} else {
-				P::Scalar::ZERO
+				element.get(lane)
 			}
-		}));
-		dst.as_mut()
-			.par_iter_mut()
-			.with_min_task(WorkPerItem::FieldMuls)
-			.for_each(|dst_i| *dst_i += scalar_broadcast * pattern);
+		});
+		return;
 	}
+
+	let reverse_lanes = |element: P| P::from_fn(|lane| element.get(P::WIDTH - 1 - lane));
+	if let [element] = words {
+		*element = reverse_lanes(*element);
+		return;
+	}
+	// Element `j` trades places with element `n - 1 - j`, and each one's lanes reverse in transit.
+	let (low, high) = words.split_at_mut(words.len() / 2);
+	low.par_iter_mut()
+		.zip(high.par_iter_mut().rev())
+		.with_min_task(WorkPerItem::FieldMuls)
+		.for_each(|(low_i, high_i)| {
+			let low_value = *low_i;
+			*low_i = reverse_lanes(*high_i);
+			*high_i = reverse_lanes(low_value);
+		});
 }
 
 fn accumulate_scaled_buffer<P: PackedField>(
@@ -611,9 +588,10 @@ where
 		self.n_sent += 1;
 		self.n_in_round += 1;
 
-		// A lone oracle is its round oracle, padding included. Any other is copied into its block,
-		// content only, since a round-mate may nest in the slack above it.
-		let message = if layout.block_offsets.len() == 1 {
+		// A lone oracle whose block is the whole round is its round oracle, padding included. Any
+		// other is copied into its block, content only, since a round-mate may nest in the slack
+		// above it, or the round may have grown past it to hold the ZK pad.
+		let message = if layout.block_offsets.len() == 1 && layout.log_len == spec.log_msg_len() {
 			FieldBuffer::from_view_in(&self.alloc, buffer)
 		} else {
 			let message = self
@@ -674,18 +652,20 @@ where
 
 #[cfg(test)]
 mod tests {
-	use std::iter;
+	use std::{collections::BTreeSet, iter};
 
-	use binius_compute::GlobalAllocator;
+	use binius_alloc::GlobalAllocator;
 	use binius_field::{
 		BinaryField, Field, Ghash128b, Ghash128b as B128, PackedField, PackedGhash1x128b,
-		PackedGhash2x128b, PackedGhash4x128b, Random,
+		PackedGhash2x128b, PackedGhash4x128b,
 	};
 	use binius_hash::{StdDigest, StdHashSuite};
 	use binius_iop::{
-		basefold::compiler::BaseFoldVerifierCompiler,
+		basefold::{
+			compiler::BaseFoldVerifierCompiler,
+			layout::{layout_rounds, zk_commit_index, zk_commit_point},
+		},
 		channel::{IOPVerifierChannel, OracleSchedule, OracleSpec, TransparentEvalFn},
-		fri::MinProofSizeStrategy,
 		merkle_tree::BinaryMerkleTreeScheme,
 	};
 	use binius_ip::channel::IPVerifierChannel;
@@ -693,15 +673,16 @@ mod tests {
 	use binius_math::{
 		FieldBuffer,
 		inner_product::inner_product_buffers,
-		multilinear::eq::eq_ind_partial_eval,
+		multilinear::{eq::eq_ind_partial_eval, evaluate::evaluate},
 		ntt::{NeighborsLastSingleThread, domain_context::GaoMateerOnTheFly},
+		reed_solomon::ReedSolomonCode,
 		test_utils::{random_field_buffer, random_scalars},
 	};
 	use binius_transcript::{ProverTranscript, VerifierTranscript, fiat_shamir::HasherChallenger};
 	use proptest::prelude::*;
-	use rand::{Rng, SeedableRng, rngs::StdRng};
+	use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 
-	use super::{IOPProverChannel, place_repeated};
+	use super::{IOPProverChannel, permute_to_zk_commit_order};
 	use crate::basefold::compiler::BaseFoldProverCompiler;
 
 	type StdChallenger = HasherChallenger<StdDigest>;
@@ -767,7 +748,6 @@ mod tests {
 			oracle_schedule,
 			LOG_INV_RATE,
 			n_test_queries,
-			&MinProofSizeStrategy,
 		);
 
 		// === PROVER SIDE ===
@@ -831,7 +811,6 @@ mod tests {
 			oracle_schedule,
 			LOG_INV_RATE,
 			n_test_queries,
-			&MinProofSizeStrategy,
 		);
 
 		// === PROVER SIDE ===
@@ -900,7 +879,6 @@ mod tests {
 			OracleSchedule::from_rounds(oracle_specs.map(|spec| [spec])),
 			LOG_INV_RATE,
 			n_test_queries,
-			&MinProofSizeStrategy,
 		);
 
 		// === PROVER SIDE ===
@@ -981,7 +959,6 @@ mod tests {
 			OracleSchedule::from_rounds(oracle_specs.map(|spec| [spec])),
 			LOG_INV_RATE,
 			n_test_queries,
-			&MinProofSizeStrategy,
 		);
 
 		let ntt = make_ntt(verifier_compiler.max_log_domain_size());
@@ -1056,60 +1033,6 @@ mod tests {
 	///
 	/// The `[1, 2]` batch sits just the other side of the boundary — its blocks are exactly one
 	/// packed element — and covers the chunked path that the clamp must leave alone.
-	/// [`place_repeated`] must match the definition it implements, at every shape.
-	///
-	/// The two regimes it splits on — a lift block spanning whole packed elements, and several
-	/// blocks sharing one element — are selected by `log_block` against `P::LOG_WIDTH`, so the grid
-	/// runs three packed widths against every `(log_src, log_block, log_dst)` they admit. That
-	/// reaches shapes the FRI parameters do not currently produce, which is the point: the
-	/// placement should not depend on which of them the optimizer happens to choose.
-	#[test]
-	fn place_repeated_matches_the_naive_placement() {
-		fn check<P: PackedField<Scalar = B128>>(log_src: usize, log_block: usize, log_dst: usize) {
-			let mut rng = StdRng::seed_from_u64(0);
-			let src = random_field_buffer::<P>(&mut rng, log_src);
-			let initial = random_field_buffer::<P>(&mut rng, log_dst);
-			let scalar = B128::random(&mut rng);
-
-			// The definition: `scalar * src` lands in the low `2^log_src` scalars of each
-			// `2^log_block`-sized block, and nowhere else.
-			let mut expected = initial.clone();
-			for index in 0..1usize << log_dst {
-				let position = index % (1usize << log_block);
-				if position < 1usize << log_src {
-					expected.set(index, expected.get(index) + scalar * src.get(position));
-				}
-			}
-
-			let mut actual = initial;
-			place_repeated(actual.as_mut_view(), src.as_view(), scalar, log_block);
-
-			for index in 0..1usize << log_dst {
-				assert_eq!(
-					actual.get(index),
-					expected.get(index),
-					"P::LOG_WIDTH={}, log_src={log_src}, log_block={log_block}, log_dst={log_dst}, \
-					 index={index}",
-					P::LOG_WIDTH,
-				);
-			}
-		}
-
-		fn check_all_shapes<P: PackedField<Scalar = B128>>() {
-			for log_dst in 0..=4 {
-				for log_block in 0..=log_dst {
-					for log_src in 0..=log_block {
-						check::<P>(log_src, log_block, log_dst);
-					}
-				}
-			}
-		}
-
-		check_all_shapes::<PackedGhash1x128b>();
-		check_all_shapes::<PackedGhash2x128b>();
-		check_all_shapes::<PackedGhash4x128b>();
-	}
-
 	#[test]
 	fn batch_narrower_than_a_packed_element_proves() {
 		const {
@@ -1251,7 +1174,6 @@ mod tests {
 			OracleSchedule::from_rounds(oracle_specs.map(|spec| [spec])),
 			LOG_INV_RATE,
 			n_test_queries,
-			&MinProofSizeStrategy,
 		);
 
 		// === PROVER SIDE ===
@@ -1369,7 +1291,6 @@ mod tests {
 			OracleSchedule::from_rounds(oracle_specs.map(|spec| [spec])),
 			LOG_INV_RATE,
 			n_test_queries,
-			&MinProofSizeStrategy,
 		);
 
 		// === PROVER SIDE ===
@@ -1496,7 +1417,6 @@ mod tests {
 			schedule,
 			LOG_INV_RATE,
 			calculate_n_test_queries(SECURITY_BITS, LOG_INV_RATE),
-			&MinProofSizeStrategy,
 		);
 		let ntt = make_ntt(verifier_compiler.max_log_domain_size());
 		let prover_compiler =
@@ -1569,11 +1489,192 @@ mod tests {
 	#[test]
 	fn test_basefold_channel_tenants_nest_in_slack() {
 		// The 9-entry oracle nests in the 15-entry one's slack, and the 2^2 one in the 9-entry
-		// one's, all inside one 2^5 round oracle.
+		// one's, all inside the first 2^5 entries. The round is masked, so its ZK pad grows the
+		// round oracle to 2^6 above them.
 		let rounds = [vec![(15, false), (9, true), (1 << 2, true)]];
 		assert!(run_round_trip::<PackedGhash1x128b>(&rounds, false));
 		assert!(run_round_trip::<PackedGhash4x128b>(&rounds, false));
 		assert!(!run_round_trip::<PackedGhash4x128b>(&rounds, true));
+	}
+
+	/// The prover's reversal of a ZK round agrees with the index map and the verifier's point
+	/// map.
+	///
+	/// The permutation splits on whether the buffer spans whole packed elements, so this runs three
+	/// packed widths over lengths on both sides of each.
+	#[test]
+	fn zk_commit_order_matches_the_index_map_and_the_point_map() {
+		fn check<P: PackedField<Scalar = B128>>(log_len: usize) {
+			let mut rng = StdRng::seed_from_u64(log_len as u64);
+			let table = random_field_buffer::<P>(&mut rng, log_len);
+			let mut committed = table.clone();
+			permute_to_zk_commit_order(committed.as_mut_view());
+
+			for index in 0..1 << log_len {
+				assert_eq!(
+					committed.get(index),
+					table.get(zk_commit_index(index, log_len)),
+					"P::LOG_WIDTH={}, log_len={log_len}, index={index}",
+					P::LOG_WIDTH,
+				);
+			}
+
+			let point = random_scalars::<B128>(&mut rng, log_len);
+			assert_eq!(evaluate(&committed, &point), evaluate(&table, &zk_commit_point(&point)));
+		}
+
+		for log_len in 0..=6 {
+			check::<PackedGhash1x128b>(log_len);
+			check::<PackedGhash2x128b>(log_len);
+			check::<PackedGhash4x128b>(log_len);
+		}
+	}
+
+	/// The rank of a matrix over a field, by Gaussian elimination.
+	fn rank<F: Field>(mut rows: Vec<Vec<F>>) -> usize {
+		let n_cols = rows.first().map_or(0, Vec::len);
+		let mut rank = 0;
+		for col in 0..n_cols {
+			let Some(pivot) = (rank..rows.len()).find(|&row| rows[row][col] != F::ZERO) else {
+				continue;
+			};
+			rows.swap(rank, pivot);
+			let pivot_inverse = rows[rank][col].invert_or_zero();
+			let pivot_row = rows[rank].clone();
+			for (index, row) in rows.iter_mut().enumerate() {
+				if index != rank && row[col] != F::ZERO {
+					let factor = row[col] * pivot_inverse;
+					for (entry, &pivot_entry) in iter::zip(&mut row[col..], &pivot_row[col..]) {
+						*entry -= factor * pivot_entry;
+					}
+				}
+			}
+			rank += 1;
+		}
+		rank
+	}
+
+	/// Any `q` opened symbols of a ZK round, restricted to its pad, are linearly independent.
+	///
+	/// This is what makes the opened symbols uniform given the rest of the round oracle. Encoding
+	/// is linear, so the test encodes the unit vector of each pad coordinate, as the round is
+	/// committed, and checks that their symbols at `q` positions form a matrix of full rank.
+	///
+	/// The positions `0..q` are the hard case. They lie in the low subspaces `U_k`, where a symbol
+	/// reads only the entries the encoder takes as low coefficients. Without the reversal, those
+	/// entries are the round oracle's first, and the pad reaches none of the symbols there.
+	#[test]
+	fn any_q_opened_symbols_of_a_zk_round_are_independent_on_its_pad() {
+		type F = B128;
+		type P = PackedGhash1x128b;
+		let n_test_queries = 20;
+
+		let schedule = OracleSchedule::from_rounds([[OracleSpec::new_zk(100)]]);
+		let layout = layout_rounds(&schedule, n_test_queries).swap_remove(0);
+		let rs_code = ReedSolomonCode::<F>::new(layout.log_len, LOG_INV_RATE);
+		let ntt = make_ntt(rs_code.log_len());
+
+		let encode_pad_unit_vectors = |relabel: bool| {
+			layout
+				.pad()
+				.map(|coordinate| {
+					let mut message = FieldBuffer::<P>::zeros(layout.log_len);
+					message.set(coordinate, F::ONE);
+					if relabel {
+						permute_to_zk_commit_order(message.as_mut_view());
+					}
+					rs_code.encode_batch(&ntt, message.as_view(), 0, &GlobalAllocator)
+				})
+				.collect::<Vec<_>>()
+		};
+		let codewords = encode_pad_unit_vectors(true);
+		let rank_at = |positions: &[usize]| {
+			let rows = positions
+				.iter()
+				.map(|&position| {
+					codewords
+						.iter()
+						.map(|codeword| codeword.get(position))
+						.collect()
+				})
+				.collect();
+			rank::<F>(rows)
+		};
+
+		let low_positions = (0..n_test_queries).collect::<Vec<_>>();
+		assert_eq!(rank_at(&low_positions), n_test_queries);
+
+		let mut rng = StdRng::seed_from_u64(0);
+		for _ in 0..16 {
+			let mut positions = BTreeSet::new();
+			while positions.len() < n_test_queries {
+				positions.insert(rng.random_range(0..rs_code.len()));
+			}
+			let positions = positions.into_iter().collect::<Vec<_>>();
+			assert_eq!(rank_at(&positions), n_test_queries, "positions {positions:?}");
+		}
+
+		// Without the relabeling, the symbol at position 0 is the round oracle's coordinate 0.
+		let unrelabeled = encode_pad_unit_vectors(false);
+		assert!(
+			unrelabeled
+				.iter()
+				.all(|codeword| codeword.get(0) == F::ZERO)
+		);
+	}
+
+	/// Every symbol of a ZK round's committed codeword depends on the prover's coins.
+	///
+	/// This commits the same witness under two prover seeds and compares the `Enc(M_r)` half of
+	/// the codewords. A symbol that agrees between them is a fixed function of the witness, which
+	/// the query phase reveals whenever a query lands on its position. The witness starts at
+	/// coordinate 0, which the encoder reads as the constant coefficient, so without
+	/// the reversal the symbol at position 0 would be the witness's first entry.
+	///
+	/// The two specs cover a round that holds its pad in its slack, and one that grows for it.
+	#[test]
+	fn every_symbol_of_a_zk_round_depends_on_the_prover_coins() {
+		type F = B128;
+		type P = PackedGhash1x128b;
+		let n_vars = 7;
+		let witness = random_field_buffer::<P>(StdRng::seed_from_u64(0), n_vars);
+
+		let commit = |spec: OracleSpec, seed: u64| -> Vec<F> {
+			let verifier_compiler = BaseFoldVerifierCompiler::new(
+				&make_merkle_scheme(),
+				OracleSchedule::from_rounds([[spec]]),
+				LOG_INV_RATE,
+				calculate_n_test_queries(SECURITY_BITS, LOG_INV_RATE),
+			);
+			let ntt = make_ntt(verifier_compiler.max_log_domain_size());
+			let prover_compiler =
+				BaseFoldProverCompiler::<P, _>::from_verifier_compiler(&verifier_compiler, ntt);
+			let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+			let mut prover_channel = prover_compiler
+				.create_channel_from_transcript::<StdHashSuite, StdChallenger, _, _>(
+					&mut prover_transcript,
+					StdRng::seed_from_u64(seed),
+					GlobalAllocator,
+				);
+			prover_channel.send_oracle(witness.as_view());
+
+			// The codeword interleaves `Enc(M_r)` and `Enc(ω_r)` symbol by symbol.
+			prover_channel.committed_oracles[0]
+				.codeword
+				.iter_scalars()
+				.step_by(2)
+				.collect()
+		};
+
+		for spec in [OracleSpec::new_zk(90), OracleSpec::new_zk(1 << n_vars)] {
+			let symbols = commit(spec, 1);
+			let other_symbols = commit(spec, 2);
+			for (position, (symbol, other_symbol)) in
+				iter::zip(&symbols, &other_symbols).enumerate()
+			{
+				assert_ne!(symbol, other_symbol, "{spec:?}, position {position}");
+			}
+		}
 	}
 
 	/// One oracle of `2^ℓ` slots, for `ℓ < 5`, holding more than half of them.

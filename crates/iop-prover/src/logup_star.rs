@@ -17,7 +17,7 @@
 //!
 //! [Soukhanov25]: <https://eprint.iacr.org/2025/946>
 
-use binius_compute::Allocator;
+use binius_alloc::Allocator;
 use binius_field::{BinaryField, Divisible, PackedField};
 use binius_ip_prover::logup_star::{self as reduction, LogupTableOutput, witness};
 pub use binius_ip_prover::logup_star::{Looker, TableLookup};
@@ -230,7 +230,7 @@ where
 mod tests {
 	use std::iter;
 
-	use binius_compute::GlobalAllocator;
+	use binius_alloc::GlobalAllocator;
 	use binius_field::{
 		BinaryField1b, ExtensionField, Field, PackedGhash1x128b,
 		arch::{OptimalB128, OptimalPackedB128},
@@ -239,7 +239,6 @@ mod tests {
 	use binius_iop::{
 		basefold::compiler::BaseFoldVerifierCompiler,
 		channel::{OracleSchedule, OracleSpec, naive::NaiveVerifierChannel},
-		fri::MinProofSizeStrategy,
 		logup_star::{self as verify_logup, TransparentTableLookup},
 		merkle_tree::BinaryMerkleTreeScheme,
 	};
@@ -658,7 +657,6 @@ mod tests {
 			OracleSchedule::from_rounds(oracle_specs.map(|spec| [spec])),
 			LOG_INV_RATE,
 			n_test_queries,
-			&MinProofSizeStrategy,
 		);
 
 		// Prove: commit the pushforwards with real FRI, run the reduction, open both relations.
@@ -712,7 +710,6 @@ mod tests {
 			OracleSchedule::from_rounds(oracle_specs.map(|spec| [spec])),
 			LOG_INV_RATE,
 			n_test_queries,
-			&MinProofSizeStrategy,
 		);
 
 		// Prove: commit the pushforwards with real FRI, run the reduction, open them.

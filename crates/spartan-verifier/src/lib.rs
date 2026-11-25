@@ -44,7 +44,7 @@ use binius_iop::{
 		IOPVerifierChannel, OracleSchedule,
 		oracle_setup::{DummyElem, OracleSetupChannel},
 	},
-	fri::{self, MinProofSizeStrategy},
+	fri,
 	merkle_tree::BinaryMerkleTreeScheme,
 };
 use binius_ip::{channel::IPVerifierChannel, libra, mlecheck, sumcheck};
@@ -256,7 +256,7 @@ where
 	) -> Result<Self, Error> {
 		// Modify the constraint system for zero-knowledge.
 		let n_test_queries = fri::calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
-		let blinding_info = BlindingInfo::for_fri_queries(n_test_queries);
+		let blinding_info = BlindingInfo::default();
 		let constraint_system = ConstraintSystemPadded::new(constraint_system, blinding_info);
 
 		let iop_verifier = IOPVerifier::new(constraint_system);
@@ -268,7 +268,6 @@ where
 			iop_verifier.oracle_schedule(),
 			log_inv_rate,
 			n_test_queries,
-			&MinProofSizeStrategy,
 		);
 
 		Ok(Self {

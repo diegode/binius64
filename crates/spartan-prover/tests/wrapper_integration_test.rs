@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use binius_compute::GlobalAllocator;
+use binius_alloc::GlobalAllocator;
 use binius_field::{Field, Ghash128b as B128, Random, arch::OptimalPackedB128};
 use binius_hash::StdHashSuite;
 use binius_iop::{
@@ -11,7 +11,7 @@ use binius_iop::{
 		IOPVerifierChannel, OracleSpec,
 		oracle_setup::{DummyElem, OracleSetupChannel},
 	},
-	fri::{self, MinProofSizeStrategy},
+	fri,
 	merkle_tree::BinaryMerkleTreeScheme,
 };
 use binius_iop_prover::{basefold::compiler::BaseFoldProverCompiler, channel::IOPProverChannel};
@@ -115,7 +115,6 @@ fn test_zk_wrapped_prove_verify() {
 	let inner_cs = ConstraintSystemPadded::new(
 		inner_cs,
 		BlindingInfo {
-			n_dummy_wires: 0,
 			n_dummy_constraints: 0,
 		},
 	);
@@ -140,7 +139,7 @@ fn test_zk_wrapped_prove_verify() {
 	// === Step 4: Build outer padded constraint system ===
 	let log_inv_rate = 1;
 	let n_test_queries = fri::calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
-	let blinding_info = BlindingInfo::for_fri_queries(n_test_queries);
+	let blinding_info = BlindingInfo::default();
 	let outer_cs = ConstraintSystemPadded::new(outer_cs, blinding_info);
 	let outer_layout = Arc::new(outer_layout.with_blinding(*outer_cs.blinding_info()));
 
@@ -178,7 +177,6 @@ fn test_zk_wrapped_prove_verify() {
 		combined_schedule,
 		log_inv_rate,
 		n_test_queries,
-		&MinProofSizeStrategy,
 	);
 
 	let domain_context = GaoMateerOnTheFly::generate(zk_basefold_compiler.max_log_domain_size());
