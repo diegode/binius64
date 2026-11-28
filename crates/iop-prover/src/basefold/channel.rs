@@ -652,23 +652,25 @@ where
 
 #[cfg(test)]
 mod tests {
-	use std::{collections::BTreeSet, iter};
+	use std::{cell::RefCell, collections::BTreeSet, iter, rc::Rc};
 
 	use binius_alloc::GlobalAllocator;
+	use binius_core::word::Word;
 	use binius_field::{
 		BinaryField, Field, Ghash128b, Ghash128b as B128, PackedField, PackedGhash1x128b,
-		PackedGhash2x128b, PackedGhash4x128b,
+		PackedGhash2x128b, PackedGhash4x128b, arithmetic_traits::InvertOrZero,
 	};
-	use binius_hash::{StdDigest, StdHashSuite};
+	use binius_hash::{HashSuite, StdDigest, StdHashSuite, hash_serialize};
 	use binius_iop::{
 		basefold::{
 			compiler::BaseFoldVerifierCompiler,
 			layout::{layout_rounds, zk_commit_index, zk_commit_point},
 		},
 		channel::{IOPVerifierChannel, OracleSchedule, OracleSpec, TransparentEvalFn},
+		merkle_channel::{self, MerkleIPVerifierChannel, VerifierMerkleTranscriptChannel},
 		merkle_tree::BinaryMerkleTreeScheme,
 	};
-	use binius_ip::channel::IPVerifierChannel;
+	use binius_ip::channel::{IPVerifierChannel, WordIPVerifierChannel};
 	use binius_ip_prover::channel::IPProverChannel;
 	use binius_math::{
 		FieldBuffer,
@@ -1554,17 +1556,18 @@ mod tests {
 		rank
 	}
 
-	/// Any `q` opened symbols of a ZK round, restricted to its pad, are linearly independent.
+	/// Any `q + 1` symbols of a ZK round, restricted to its pad, are linearly independent.
 	///
-	/// This is what makes the opened symbols uniform given the rest of the round oracle. Encoding
-	/// is linear, so the test encodes the unit vector of each pad coordinate, as the round is
-	/// committed, and checks that their symbols at `q` positions form a matrix of full rank.
+	/// This makes `q` opened symbols uniform given the rest of the round oracle, and keeps one more
+	/// symbol uniform given them. Encoding is linear, so the test encodes the unit vector of each
+	/// pad coordinate, as the round is committed, and checks that their symbols at `q + 1`
+	/// positions form a matrix of full rank.
 	///
-	/// The positions `0..q` are the hard case. They lie in the low subspaces `U_k`, where a symbol
+	/// The positions `0..=q` are the hard case. They lie in the low subspaces `U_k`, where a symbol
 	/// reads only the entries the encoder takes as low coefficients. Without the reversal, those
 	/// entries are the round oracle's first, and the pad reaches none of the symbols there.
 	#[test]
-	fn any_q_opened_symbols_of_a_zk_round_are_independent_on_its_pad() {
+	fn any_q_plus_one_symbols_of_a_zk_round_are_independent_on_its_pad() {
 		type F = B128;
 		type P = PackedGhash1x128b;
 		let n_test_queries = 20;
@@ -1601,17 +1604,18 @@ mod tests {
 			rank::<F>(rows)
 		};
 
-		let low_positions = (0..n_test_queries).collect::<Vec<_>>();
-		assert_eq!(rank_at(&low_positions), n_test_queries);
+		let n_positions = n_test_queries + 1;
+		let low_positions = (0..n_positions).collect::<Vec<_>>();
+		assert_eq!(rank_at(&low_positions), n_positions);
 
 		let mut rng = StdRng::seed_from_u64(0);
 		for _ in 0..16 {
 			let mut positions = BTreeSet::new();
-			while positions.len() < n_test_queries {
+			while positions.len() < n_positions {
 				positions.insert(rng.random_range(0..rs_code.len()));
 			}
 			let positions = positions.into_iter().collect::<Vec<_>>();
-			assert_eq!(rank_at(&positions), n_test_queries, "positions {positions:?}");
+			assert_eq!(rank_at(&positions), n_positions, "positions {positions:?}");
 		}
 
 		// Without the relabeling, the symbol at position 0 is the round oracle's coordinate 0.
@@ -1675,6 +1679,339 @@ mod tests {
 				assert_ne!(symbol, other_symbol, "{spec:?}, position {position}");
 			}
 		}
+	}
+
+	/// The leaves of one commitment that a verifier opens, with their values in leaf order.
+	struct RecordedOpening {
+		indices: Vec<usize>,
+		values: Vec<B128>,
+	}
+
+	/// A verifier channel that forwards every call and records the Merkle openings it receives.
+	///
+	/// The recorded openings are the verifier's view of the query phase: for every commitment it
+	/// opens, in the order it opens them, the leaves it asks for and the values it gets back.
+	struct OpeningRecorder<Channel> {
+		inner: Channel,
+		openings: Rc<RefCell<Vec<RecordedOpening>>>,
+	}
+
+	impl<Channel> IPVerifierChannel<B128> for OpeningRecorder<Channel>
+	where
+		Channel: IPVerifierChannel<B128, Elem = B128>,
+	{
+		type Elem = B128;
+
+		fn recv_one(&mut self) -> Result<B128, binius_ip::channel::Error> {
+			self.inner.recv_one()
+		}
+
+		fn recv_many(&mut self, n: usize) -> Result<Vec<B128>, binius_ip::channel::Error> {
+			self.inner.recv_many(n)
+		}
+
+		fn recv_array<const N: usize>(&mut self) -> Result<[B128; N], binius_ip::channel::Error> {
+			self.inner.recv_array()
+		}
+
+		fn recv_public_claim(&mut self) -> Result<B128, binius_ip::channel::Error> {
+			self.inner.recv_public_claim()
+		}
+
+		fn sample(&mut self) -> B128 {
+			self.inner.sample()
+		}
+
+		fn sample_many(&mut self, n: usize) -> Vec<B128> {
+			self.inner.sample_many(n)
+		}
+
+		fn sample_array<const N: usize>(&mut self) -> [B128; N] {
+			self.inner.sample_array()
+		}
+
+		fn observe_one(&mut self, val: B128) -> B128 {
+			self.inner.observe_one(val)
+		}
+
+		fn observe_many(&mut self, vals: &[B128]) -> Vec<B128> {
+			self.inner.observe_many(vals)
+		}
+
+		fn assert_zero(&mut self, val: B128) -> Result<(), binius_ip::channel::Error> {
+			self.inner.assert_zero(val)
+		}
+	}
+
+	impl<Channel> WordIPVerifierChannel<B128> for OpeningRecorder<Channel>
+	where
+		Channel: WordIPVerifierChannel<B128, Elem = B128, Word = Word>,
+	{
+		type Word = Word;
+
+		fn observe_words(&mut self, words: &[Word]) -> Vec<Word> {
+			self.inner.observe_words(words)
+		}
+
+		fn subset_sum(&mut self, elems: &[B128], word: &Word) -> B128 {
+			self.inner.subset_sum(elems, word)
+		}
+
+		fn select(&mut self, elems: &[B128], word: &Word) -> B128 {
+			self.inner.select(elems, word)
+		}
+
+		fn sample_bits(&mut self, bits: usize) -> Word {
+			self.inner.sample_bits(bits)
+		}
+
+		fn pack_words(&mut self, words: &[Word]) -> Vec<B128> {
+			self.inner.pack_words(words)
+		}
+	}
+
+	impl<Channel> MerkleIPVerifierChannel<B128> for OpeningRecorder<Channel>
+	where
+		Channel: MerkleIPVerifierChannel<B128, Elem = B128, Word = Word>,
+	{
+		type Commitment = Channel::Commitment;
+
+		fn recv_merkle_commitment(
+			&mut self,
+			leaf_size: usize,
+			depth: usize,
+		) -> Result<Self::Commitment, merkle_channel::Error> {
+			self.inner.recv_merkle_commitment(leaf_size, depth)
+		}
+
+		fn recv_openings(
+			&mut self,
+			commitment: &Self::Commitment,
+			indices: &[Word],
+		) -> Result<Vec<B128>, merkle_channel::Error> {
+			let values = self.inner.recv_openings(commitment, indices)?;
+			self.openings.borrow_mut().push(RecordedOpening {
+				indices: indices
+					.iter()
+					.map(|index| index.as_u64() as usize)
+					.collect(),
+				values: values.clone(),
+			});
+			Ok(values)
+		}
+
+		fn recv_committed_vector(
+			&mut self,
+			commitment: &Self::Commitment,
+		) -> Result<Vec<B128>, merkle_channel::Error> {
+			self.inner.recv_committed_vector(commitment)
+		}
+	}
+
+	/// A solution of `rows · v = rhs` over a field with every free variable set to zero, or
+	/// `None` if the system has no solution.
+	fn solve<F: Field>(mut rows: Vec<Vec<F>>, mut rhs: Vec<F>) -> Option<Vec<F>> {
+		let n_cols = rows.first().map_or(0, Vec::len);
+		let mut pivot_cols = Vec::new();
+		for col in 0..n_cols {
+			let rank = pivot_cols.len();
+			let Some(pivot) = (rank..rows.len()).find(|&row| rows[row][col] != F::ZERO) else {
+				continue;
+			};
+			rows.swap(rank, pivot);
+			rhs.swap(rank, pivot);
+			let pivot_inverse = rows[rank][col].invert_or_zero();
+			for entry in &mut rows[rank][col..] {
+				*entry *= pivot_inverse;
+			}
+			rhs[rank] *= pivot_inverse;
+			let pivot_row = rows[rank].clone();
+			let pivot_rhs = rhs[rank];
+			for (index, row) in rows.iter_mut().enumerate() {
+				if index != rank && row[col] != F::ZERO {
+					let factor = row[col];
+					for (entry, &pivot_entry) in iter::zip(&mut row[col..], &pivot_row[col..]) {
+						*entry -= factor * pivot_entry;
+					}
+					rhs[index] -= factor * pivot_rhs;
+				}
+			}
+			pivot_cols.push(col);
+		}
+		if rhs[pivot_cols.len()..]
+			.iter()
+			.any(|&value| value != F::ZERO)
+		{
+			return None;
+		}
+		let mut solution = vec![F::ZERO; n_cols];
+		for (row, &col) in pivot_cols.iter().enumerate() {
+			solution[col] = rhs[row];
+		}
+		Some(solution)
+	}
+
+	/// A proof does not let someone who knows the witness rebuild an unopened leaf of a ZK round.
+	///
+	/// Merkle leaves are hashed without salts, and the authentication path of an opened leaf
+	/// carries the digest of its unopened neighbour. That leaf, the column
+	/// `(Enc(M_r)[x], Enc(ω_r)[x])`, is hidden only if the proof leaves it unpredictable, even to a
+	/// distinguisher that knows the witness. Here the round holds only the witness, which therefore
+	/// fixes all of `M_r` except the pad. The test runs such a distinguisher on the verifier's view
+	/// of the proof:
+	///
+	/// 1. Subtracting the witness's own symbols from the opened `Enc(M_r)` symbols leaves the pad's
+	///    symbols at the queried positions, so the distinguisher solves for a pad that has them.
+	/// 2. The first FRI oracle opens the whole coset of the batch-folded codeword `B = Enc(M_r) +
+	///    γ·(Enc(ω_r) - Enc(M_r))` around each query. The opened column at a query `e` gives `γ`,
+	///    and `B` at `x = e ^ 1` then gives `Enc(ω_r)[x]` from `Enc(M_r)[x]`.
+	///
+	/// If the queries determine the pad, the rebuilt column is the committed one, and its digest
+	/// is in the proof. With one pad coordinate more than the number of distinct queries, every
+	/// unopened column is uniform over `|F|` values given the opened columns and the folded word.
+	#[test]
+	fn a_witness_does_not_determine_an_unopened_leaf_of_a_zk_round() {
+		type F = B128;
+		type P = PackedGhash1x128b;
+		let n_vars = 12;
+
+		let mut rng = StdRng::seed_from_u64(0);
+		let (witness, transparent, claim) = generate_zk_oracle_data::<F, P, _>(&mut rng, n_vars);
+		let verifier_compiler = BaseFoldVerifierCompiler::new(
+			&make_merkle_scheme(),
+			OracleSchedule::from_rounds([[OracleSpec::new_zk(1 << n_vars)]]),
+			LOG_INV_RATE,
+			calculate_n_test_queries(SECURITY_BITS, LOG_INV_RATE),
+		);
+		let layout = &verifier_compiler.layouts()[0];
+		let rs_code = verifier_compiler.fri_params().rs_code();
+		let ntt = make_ntt(verifier_compiler.max_log_domain_size());
+		// `Enc(M_r)` of a round table, which is reversed before it is encoded.
+		let encode = |table: &FieldBuffer<P>| {
+			let mut committed = table.clone();
+			permute_to_zk_commit_order(committed.as_mut_view());
+			rs_code.encode_batch(&ntt, committed.as_view(), 0, &GlobalAllocator)
+		};
+
+		// === PROVER SIDE ===
+		let prover_compiler = BaseFoldProverCompiler::<P, _>::from_verifier_compiler(
+			&verifier_compiler,
+			make_ntt(verifier_compiler.max_log_domain_size()),
+		);
+		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+		let mut prover_channel = prover_compiler
+			.create_channel_from_transcript::<StdHashSuite, StdChallenger, _, _>(
+				&mut prover_transcript,
+				StdRng::seed_from_u64(1),
+				GlobalAllocator,
+			);
+		let oracle = prover_channel.send_oracle(witness.as_view());
+
+		// The distinguisher's encoding must be the prover's: the committed codeword interleaves
+		// `Enc(M_r)` with `Enc(ω_r)`, and its even entries encode the committed table.
+		let committed = &prover_channel.committed_oracles[0];
+		let committed_symbols =
+			rs_code.encode_batch(&ntt, committed.message.as_view(), 0, &GlobalAllocator);
+		assert!(
+			iter::zip(
+				committed_symbols.iter_scalars(),
+				committed.codeword.iter_scalars().step_by(2)
+			)
+			.all(|(symbol, committed_symbol)| symbol == committed_symbol)
+		);
+
+		prover_channel.prove_oracle_relation(oracle, transparent.clone(), claim);
+		prover_channel.finish();
+		let proof = prover_transcript.finalize();
+
+		// === VERIFIER SIDE, recording the openings ===
+		let openings = Rc::new(RefCell::new(Vec::new()));
+		let mut verifier_transcript =
+			VerifierTranscript::new(StdChallenger::default(), proof.clone());
+		let mut verifier_channel = verifier_compiler.create_channel(OpeningRecorder {
+			inner: VerifierMerkleTranscriptChannel::<_, StdChallenger, F, StdHashSuite>::new(
+				&mut verifier_transcript,
+			),
+			openings: Rc::clone(&openings),
+		});
+		let v_oracle = verifier_channel.recv_oracle(1 << n_vars, true).unwrap();
+		verifier_channel
+			.verify_oracle_relation(v_oracle, eq_eval_fn(transparent), claim)
+			.unwrap();
+		verifier_channel.finish().unwrap();
+
+		// === DISTINGUISHER: the witness and the verifier's view ===
+		let openings = openings.borrow();
+		let [input, first_fold, ..] = openings.as_slice() else {
+			panic!("the query phase opens the input oracle and then the first FRI oracle");
+		};
+		let queries = &input.indices;
+		let queried = queries.iter().copied().collect::<BTreeSet<_>>();
+		assert_eq!(queried.len(), queries.len(), "the test needs distinct queries");
+		let coset_len = first_fold.values.len() / first_fold.indices.len();
+		assert!(coset_len >= 2, "a coset of the first FRI oracle holds a query's neighbour");
+		let (query, e) = queries
+			.iter()
+			.copied()
+			.enumerate()
+			.find(|&(_, e)| !queried.contains(&(e ^ 1)))
+			.expect("some query has an unopened neighbour");
+		let x = e ^ 1;
+
+		// A leaf of the input oracle is a column `(Enc(M_r)[x], Enc(ω_r)[x])`, and a leaf of the
+		// first FRI oracle is the coset of `B` around a query.
+		let opened_column = |k: usize| [input.values[2 * k], input.values[2 * k + 1]];
+		let folded = |position: usize| first_fold.values[query * coset_len + position % coset_len];
+		let [message_e, mask_e] = opened_column(query);
+		let gamma = (folded(e) - message_e) * (mask_e - message_e).invert_or_zero();
+
+		// The round table with the witness in its block and the pad left zero, then each pad
+		// coordinate on its own.
+		let mut known_table = FieldBuffer::<P>::zeros(layout.log_len);
+		for i in 0..1 << n_vars {
+			known_table.set(i, witness.get(i));
+		}
+		let known_symbols = encode(&known_table);
+		let pad_symbols = layout
+			.pad()
+			.map(|coordinate| {
+				let mut unit = FieldBuffer::<P>::zeros(layout.log_len);
+				unit.set(coordinate, F::ONE);
+				encode(&unit)
+			})
+			.collect::<Vec<_>>();
+
+		// Some pad whose symbols match the opened ones, and the column at `x` it implies.
+		let rows = queries
+			.iter()
+			.map(|&position| {
+				pad_symbols
+					.iter()
+					.map(|symbols| symbols.get(position))
+					.collect()
+			})
+			.collect();
+		let rhs = queries
+			.iter()
+			.enumerate()
+			.map(|(k, &position)| opened_column(k)[0] - known_symbols.get(position))
+			.collect();
+		let pad = solve(rows, rhs).expect("the opened symbols come from some pad");
+		let message_x = known_symbols.get(x)
+			+ iter::zip(&pad, &pad_symbols)
+				.map(|(&value, symbols)| value * symbols.get(x))
+				.sum::<F>();
+		let mask_x = message_x + (folded(x) - message_x) * gamma.invert_or_zero();
+
+		let digest =
+			hash_serialize::<F, <StdHashSuite as HashSuite>::LeafHash>([message_x, mask_x])
+				.unwrap();
+		assert!(
+			!proof
+				.windows(digest.len())
+				.any(|window| window == digest.as_slice()),
+			"the witness and the proof determine unopened leaf {x}, whose digest is in the proof",
+		);
 	}
 
 	/// One oracle of `2^ℓ` slots, for `ℓ < 5`, holding more than half of them.
