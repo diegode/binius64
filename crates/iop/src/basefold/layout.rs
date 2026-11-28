@@ -20,14 +20,35 @@
 //!
 //! A zero-knowledge round is therefore committed reversed: entry `i` of its committed table is
 //! `M_r[σ(i)]`, where [`zk_commit_index`] gives `σ`, which complements the bits of `i`. Coefficient
-//! `c` of its codeword is then `M_r[2^ℓ - 1 - c]`. The pad is the top `q` coordinates of `M_r`, so
-//! it fills the coefficients `0..q`, whose basis polynomials span the polynomials of degree below
-//! `q`. Restricted to the pad, the symbols at `q` distinct positions are evaluations of those
-//! polynomials at distinct points, and these are linearly independent by interpolation.
+//! `c` of its codeword is then `M_r[2^ℓ - 1 - c]`. The pad is the top `q + 1` coordinates of
+//! `M_r`, so it fills the coefficients `0..=q`, whose basis polynomials span the polynomials of
+//! degree at most `q`. By interpolation, the pad's part of the symbols at any `q + 1` distinct
+//! positions takes every value. So with the rest of `M_r` fixed, the symbols at a set `S` of at
+//! most `q` positions are uniform, and the symbol at any `x` outside `S` stays uniform given
+//! them. Repeated or lifted queries open fewer distinct positions, never more.
+//!
+//! The coordinate beyond `q` hides the leaves that are not opened. The Merkle tree hashes its
+//! leaves without salts, and the authentication path of an opened leaf carries the digest of its
+//! unopened neighbour. The first fold-round oracle opens the batch-folded codeword on the whole
+//! coset around each query, neighbour included, which reveals `B_r[x]` for the folded word
+//! `B_r = (1 - γ)·Enc(M_r) + γ·Enc(ω_r)`. With a pad of `q` coordinates, `q` distinct openings
+//! fix the pad once the rest of `M_r` is known, so anyone who knows the witness could compute the
+//! neighbour's column `(Enc(M_r)[x], Enc(ω_r)[x])` and match its digest.
+//!
+//! With `q + 1`, take `γ ≠ 0`. The mask `ω_r` is uniform, so `B_r` is independent of `M_r`, and
+//! conditioning on all of it costs nothing, even where a coset mixes several rounds. Given `B_r`,
+//! the symbol of `ω_r` at each position follows from that of `M_r`. So given `B_r` and the opened
+//! columns at `S`, the column at each unopened `x` is uniform over the `|F|` points `(a, b)` with
+//! `(1 - γ)·a + γ·b = B_r[x]`. This is Lemma B.1 of [Zo0k] for two rows. The leaf hash omits the
+//! position, which Lemma B.2 there hashes, but nothing is lost: these lines are disjoint for
+//! distinct `B_r[x]`, so one hash query matches at most one unopened leaf, except with
+//! probability about `m²/|F|` for `m` unopened leaves.
 //!
 //! The opening runs on the committed table and does not see the reversal, except where the
 //! verifier evaluates a transparent: for a zero-knowledge round it does so at
 //! [`zk_commit_point`] of the round's point.
+//!
+//! [Zo0k]: https://eprint.iacr.org/2026/391
 
 use std::{cmp::Reverse, ops::Range};
 
@@ -50,8 +71,8 @@ pub struct RoundLayout {
 	pub block_offsets: Vec<usize>,
 	/// The length of the ZK pad, which is the top `pad_len` coordinates of `M_r`.
 	///
-	/// It is `n_test_queries` for a zero-knowledge round and zero for any other. See the
-	/// [module documentation](self) for why the pad sits at the top.
+	/// It is `n_test_queries + 1` for a zero-knowledge round and zero for any other. See the
+	/// [module documentation](self) for why the pad sits at the top and has that length.
 	pub pad_len: usize,
 }
 
@@ -79,11 +100,12 @@ impl RoundLayout {
 ///
 /// ```text
 /// [ private: 98332 of 2^17 | mask 2^9 | precommit 2^10 | unused | pad ]
-///   0                        98816      99328            100352   2^17 - q   2^17
+///   0                        98816      99328            100352   2^17 - q - 1   2^17
 /// ```
 ///
-/// A zero-knowledge round reserves its top `q = n_test_queries` coordinates as the ZK pad. The
-/// round oracle is the least power of two holding every block with the pad above every extent.
+/// A zero-knowledge round reserves its top `q + 1` coordinates, for `q = n_test_queries`, as the
+/// ZK pad. The round oracle is the least power of two holding every block with the pad above
+/// every extent.
 /// With every `len_i` a full power of two, the blocks lie end to end, and a zero-knowledge round
 /// whose blocks fill a power of two grows to the next one to make room for its pad.
 pub fn layout_rounds(schedule: &OracleSchedule, n_test_queries: usize) -> Vec<RoundLayout> {
@@ -150,7 +172,7 @@ fn layout_round(specs: &[OracleSpec], n_test_queries: usize) -> RoundLayout {
 	// The pad is the top `pad_len` coordinates, so the round must reach `pad_len` past the highest
 	// extent, which is the last one because the extents are sorted and disjoint.
 	let is_zk = specs.iter().any(|spec| spec.is_zk);
-	let pad_len = if is_zk { n_test_queries } else { 0 };
+	let pad_len = if is_zk { n_test_queries + 1 } else { 0 };
 	let content_end = extents.last().map_or(0, |extent| extent.end);
 	end = end.max(content_end + pad_len);
 
@@ -170,6 +192,9 @@ mod tests {
 
 	/// A query count small enough to keep the test shapes readable.
 	const N_TEST_QUERIES: usize = 32;
+
+	/// The pad a zero-knowledge round reserves for [`N_TEST_QUERIES`] queries.
+	const PAD_LEN: usize = N_TEST_QUERIES + 1;
 
 	fn layout(specs: &[OracleSpec]) -> RoundLayout {
 		let schedule = OracleSchedule::from_rounds([specs.iter().copied()]);
@@ -191,24 +216,24 @@ mod tests {
 		assert_eq!(layout.log_len, 17);
 		assert!(layout.is_zk);
 		assert_eq!(layout.block_offsets, [97, 0, 193]);
-		assert_eq!(layout.pad(), (1 << 17) - N_TEST_QUERIES..1 << 17);
+		assert_eq!(layout.pad(), (1 << 17) - PAD_LEN..1 << 17);
 	}
 
 	#[test]
 	fn a_tenant_nests_in_another_tenants_slack() {
 		// The 2^4 oracle holds 9 entries and sits in the 2^5 one's slack at 16. The 2^2 oracle
 		// finds no room in the 2^5 one's slack, and nests in the 2^4 one's at 28. It alone is
-		// masked, which masks the whole round. Its extent ends at the round's top, so the pad
-		// grows the round to 2^6.
+		// masked, which masks the whole round. Its extent ends at 2^5, so the pad's 33 coordinates
+		// above it grow the round to 2^7.
 		let layout = layout(&[
 			OracleSpec::new(15),
 			OracleSpec::new(9),
 			OracleSpec::new_zk(1 << 2),
 		]);
-		assert_eq!(layout.log_len, 6);
+		assert_eq!(layout.log_len, 7);
 		assert!(layout.is_zk);
 		assert_eq!(layout.block_offsets, [0, 1, 7]);
-		assert_eq!(layout.pad(), 32..64);
+		assert_eq!(layout.pad(), 128 - PAD_LEN..128);
 	}
 
 	#[test]
@@ -250,18 +275,18 @@ mod tests {
 
 	#[test]
 	fn a_zk_round_with_slack_at_the_top_keeps_its_size() {
-		let layout = layout(&[OracleSpec::new_zk(900)]);
+		let layout = layout(&[OracleSpec::new_zk(1024 - PAD_LEN)]);
 		assert_eq!(layout.log_len, 10);
-		assert_eq!(layout.pad(), 1024 - N_TEST_QUERIES..1024);
+		assert_eq!(layout.pad(), 1024 - PAD_LEN..1024);
 	}
 
 	#[test]
 	fn a_zk_round_without_slack_at_the_top_grows_for_its_pad() {
-		// The content ends 16 short of the top, which is not room enough for 32 pad coordinates.
-		let layout = layout(&[OracleSpec::new_zk(1024 - 16)]);
+		// Exactly one slot per query fits, but the extra pad coordinate crosses the boundary.
+		let layout = layout(&[OracleSpec::new_zk(1024 - N_TEST_QUERIES)]);
 		assert_eq!(layout.log_len, 11);
 		assert_eq!(layout.block_offsets, [0]);
-		assert_eq!(layout.pad(), 2048 - N_TEST_QUERIES..2048);
+		assert_eq!(layout.pad(), 2048 - PAD_LEN..2048);
 	}
 
 	#[test]
@@ -282,7 +307,7 @@ mod tests {
 		];
 		for specs in shapes {
 			let layout = layout(specs);
-			assert_eq!(layout.pad_len, N_TEST_QUERIES);
+			assert_eq!(layout.pad_len, N_TEST_QUERIES + 1);
 			for (spec, &offset) in iter::zip(specs, &layout.block_offsets) {
 				let start = offset << spec.log_msg_len();
 				assert!(start + spec.len <= layout.pad().start, "{specs:?}");
